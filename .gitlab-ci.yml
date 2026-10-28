@@ -1,0 +1,83 @@
+stages:
+  - build
+  - release
+  - deploy
+  - rollback
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_COMMIT_BRANCH'
+
+variables:
+  VERSION: "1.0.${CI_PIPELINE_IID}"
+  APP_NAME: burger-maker
+  NODE_IMAGE: node:18-alpine
+  ENABLE_SOCIAL_SHARING: "true"
+  ENABLE_RATING_SYSTEM: "true"
+
+cache:
+  key: "${CI_COMMIT_REF_SLUG}"
+  paths:
+    - node_modules/
+    - .npm/
+
+build:
+  stage: build
+  image: $NODE_IMAGE
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - npm run build
+    - tar -czf ${APP_NAME}-${VERSION}.tar.gz dist/ package.json package-lock.json drizzle.config.ts shared/ server/db.ts
+  artifacts:
+    paths:
+      - ${APP_NAME}-${VERSION}.tar.gz
+    expire_in: 1 week
+
+release:
+  stage: release
+  image: curlimages/curl:latest
+  script:
+    - curl -f -u "${NEXUS_USER}:${NEXUS_PASSWORD}" --upload-file "${APP_NAME}-${VERSION}.tar.gz" "${NEXUS_URL}/repository/${NEXUS_REPO}/${APP_NAME}/${VERSION}/${APP_NAME}-${VERSION}.tar.gz"
+    - echo "Released ${APP_NAME}-${VERSION}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+deploy:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client curl
+    - mkdir -p ~/.ssh
+    - echo "${SSH_PRIVATE_KEY}" > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan -H "${VM_HOST}" >> ~/.ssh/known_hosts
+  script:
+    - ssh ${VM_USER}@${VM_HOST} "mkdir -p ~/burger-maker/releases/${VERSION}"
+    - curl -f -u "${NEXUS_USER}:${NEXUS_PASSWORD}" -o /tmp/${APP_NAME}-${VERSION}.tar.gz "${NEXUS_URL}/repository/${NEXUS_REPO}/${APP_NAME}/${VERSION}/${APP_NAME}-${VERSION}.tar.gz"
+    - scp /tmp/${APP_NAME}-${VERSION}.tar.gz ${VM_USER}@${VM_HOST}:~/burger-maker/releases/${VERSION}/
+    - ssh ${VM_USER}@${VM_HOST} "cd ~/burger-maker/releases/${VERSION} && tar -xzf ${APP_NAME}-${VERSION}.tar.gz"
+    - ssh ${VM_USER}@${VM_HOST} "cd ~/burger-maker/releases/${VERSION} && npm ci --omit=dev"
+    - ssh ${VM_USER}@${VM_HOST} "cd ~/burger-maker/releases/${VERSION} && export DATABASE_URL='${DATABASE_URL_BASIC}' && npx drizzle-kit push --force"
+    - ssh ${VM_USER}@${VM_HOST} "ln -sfn ~/burger-maker/releases/${VERSION} ~/burger-maker/current"
+    - ssh ${VM_USER}@${VM_HOST} "export APP_VERSION=${VERSION} ENABLE_SOCIAL_SHARING=${ENABLE_SOCIAL_SHARING} ENABLE_RATING_SYSTEM=${ENABLE_RATING_SYSTEM} DATABASE_URL='${DATABASE_URL_BASIC}' && cd ~/burger-maker/current && pm2 delete burger-maker || true && pm2 start dist/index.js --name burger-maker --update-env"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+rollback:
+  stage: rollback
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client curl
+    - mkdir -p ~/.ssh
+    - echo "${SSH_PRIVATE_KEY}" > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan -H "${VM_HOST}" >> ~/.ssh/known_hosts
+  script:
+    - ssh ${VM_USER}@${VM_HOST} "ln -sfn ~/burger-maker/releases/${ROLLBACK_VERSION} ~/burger-maker/current"
+    - ssh ${VM_USER}@${VM_HOST} "export APP_VERSION=${ROLLBACK_VERSION} ENABLE_SOCIAL_SHARING=${ENABLE_SOCIAL_SHARING} ENABLE_RATING_SYSTEM=${ENABLE_RATING_SYSTEM} DATABASE_URL='${DATABASE_URL_BASIC}' && cd ~/burger-maker/current && pm2 delete burger-maker || true && pm2 start dist/index.js --name burger-maker --update-env"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
